@@ -1,25 +1,31 @@
 """
 Topic evaluation utilities for CoNTM baseline.
 
-Implements the evaluation metrics from the paper (Section 4.1):
-  - Topic Coherence (TC): NPMI over top-m words (m=10), computed per-timestamp
-  - Topic Diversity (TD): 1 - topic repetition rate
-  - Topic Quality (TQ): TC × TD × (T / T_max), aggregated over timestamps
-  - Temporal Topic Smoothness (TTS): avg similarity of topic sets across consecutive timestamps
-  - Predictive Perplexity (PPL): reconstruction perplexity on the NEXT timestamp's test set
+Implements the evaluation metrics from the paper (Section 4.1), aligned with
+SubNTM (fisherman611/SubNTM) evaluation methodology:
 
-Also provides:
-  - extract_topics: extract top-m words from topic-word distributions
-  - Topic dataclass for representation
+  - Topic Coherence (TC): NPMI via gensim CoherenceModel with temporal reference corpus
+  - Topic Diversity (TD): 1 - TR (Burkhardt & Kramer, 2019) per-topic redundancy
+  - Topic Quality (TQ): (1/K_ts) Sigma TC_i x TD_i x (T_i / T_max_i)
+  - Temporal Topic Smoothness (TTS): Jaccard-based smoothness across consecutive timestamps
+  - Predictive Perplexity (PPL): reconstruction perplexity on next timestamp's test set
+  - IRBO: Inverted Rank-Biased Overlap for topic diversity (from SubNTM)
+
+References:
+  - Bouma (2009): NPMI
+  - Burkhardt & Kramer (2019): Topic Redundancy (TR)
+  - Karakkaparambil James et al. (2024): TTS
+  - SubNTM (fisherman611/SubNTM): gensim coherence, IRBO
 """
 
 import numpy as np
 import scipy.sparse as sp
+import itertools
 from dataclasses import dataclass, field
 from typing import Optional
 
 
-# ─── Topic Representation ────────────────────────────────────────────────────
+# --- Topic Representation ---
 
 @dataclass
 class Topic:
@@ -43,7 +49,7 @@ def extract_topics(
     """Extract topics from a topic-word distribution matrix.
 
     Args:
-        beta: (n_topics, vocab_size) topic-word distribution (each row sums to 1)
+        beta: (n_topics, vocab_size) topic-word distribution (each row sums to ~1)
         vocab: list of vocabulary words
         top_m: number of top words to extract per topic
 
@@ -60,19 +66,24 @@ def extract_topics(
     return topics
 
 
-# ─── Topic Coherence (NPMI) ──────────────────────────────────────────────────
+# --- Topic Coherence (TC) --- NPMI via gensim ---
 
 def compute_npmi(
     topics: list[Topic],
     reference_docs: list[list[str]],
     top_n: int = 10,
 ) -> float:
-    """Compute Normalized Pointwise Mutual Information (NPMI) topic coherence.
+    """Compute TC using gensim's CoherenceModel with 'c_npmi'.
+
+    Following SubNTM's evaluation approach:
+        - Uses gensim.CoherenceModel for standardized NPMI computation
+        - Reference corpus is the temporal reference (all docs up to current timestamp)
 
     From the paper (Section 4.1):
-        TC = (1/T) Σ_k NPMI(top-m words of topic k)
-    NPMI is computed using the *temporal* reference corpus (documents at the
-    same timestamp), following Lenz & Winker (2020).
+        "A temporal reference corpus was utilized to determine the NPMI score
+        for the topics. This means that the NPMI score for a topic at a specific
+        timestamp is calculated using the reference corpus available up to that
+        point in time."
 
     Args:
         topics: list of Topic objects
@@ -85,12 +96,45 @@ def compute_npmi(
     if len(reference_docs) == 0:
         return 0.0
 
+    try:
+        from gensim.corpora import Dictionary
+        from gensim.models import CoherenceModel
+
+        # Build topic word lists
+        topic_words = [t.words[:top_n] for t in topics]
+
+        # Build gensim dictionary from the vocabulary present in reference docs
+        dictionary = Dictionary(reference_docs)
+
+        cm = CoherenceModel(
+            texts=reference_docs,
+            dictionary=dictionary,
+            topics=topic_words,
+            topn=top_n,
+            coherence='c_npmi',
+        )
+        per_topic = cm.get_coherence_per_topic()
+        return float(np.mean(per_topic))
+
+    except ImportError:
+        # Fallback to hand-rolled NPMI if gensim is not available
+        return _compute_npmi_manual(topics, reference_docs, top_n)
+
+
+def _compute_npmi_manual(
+    topics: list[Topic],
+    reference_docs: list[list[str]],
+    top_n: int = 10,
+) -> float:
+    """Manual NPMI computation (fallback when gensim is not available)."""
+    if len(reference_docs) == 0:
+        return 0.0
+
     n_docs = len(reference_docs)
 
-    # Build word-document occurrence sets for efficient lookup
     word_doc_sets: dict[str, set[int]] = {}
     for doc_idx, doc in enumerate(reference_docs):
-        for word in set(doc):  # unique words per document
+        for word in set(doc):
             if word not in word_doc_sets:
                 word_doc_sets[word] = set()
             word_doc_sets[word].add(doc_idx)
@@ -116,12 +160,10 @@ def compute_npmi(
                 if df_ij == 0 or df_i == 0 or df_j == 0:
                     pairs_npmi.append(-1.0)
                 else:
-                    # PMI(w_i, w_j) = log[ P(w_i, w_j) / (P(w_i) * P(w_j)) ]
                     p_ij = df_ij / n_docs
                     p_i = df_i / n_docs
                     p_j = df_j / n_docs
                     pmi = np.log(p_ij / (p_i * p_j) + 1e-12)
-                    # NPMI = PMI / -log(P(w_i, w_j))
                     npmi = pmi / (-np.log(p_ij) + 1e-12)
                     pairs_npmi.append(float(npmi))
 
@@ -131,79 +173,101 @@ def compute_npmi(
     return float(np.mean(coherences)) if coherences else 0.0
 
 
-def compute_npmi_from_bow(
-    topics: list[Topic],
-    bow_matrix: sp.spmatrix,
-    vocab: list[str],
-    top_n: int = 10,
-) -> float:
-    """Compute NPMI using a BoW matrix directly (more efficient for large corpora).
+# --- Topic Diversity (TD) --- Burkhardt & Kramer (2019) ---
+
+def compute_topic_diversity(topics: list[Topic], top_n: int = 15) -> float:
+    """Topic Diversity (TD) = 1 - Topic Redundancy (TR).
+
+    From the paper (Section 4.1), using Burkhardt & Kramer (2019):
+        TR(k) = 1/(K-1) x Sum_{i=1}^{N} Sum_{j!=k} P(w_ik, j)
+    where P(w_ik, j) = 1 if word i of topic k appears in topic j's top words.
+
+        TD = 1 - (1/K) Sum_k TR(k)
+
+    This measures how much the top words of each topic overlap with other topics.
+    Higher TD means less redundancy.
 
     Args:
         topics: list of Topic objects
-        bow_matrix: (n_docs, vocab_size) sparse BoW matrix
-        vocab: vocabulary list
-        top_n: number of top words per topic
+        top_n: number of top words per topic to consider
     """
-    n_docs = bow_matrix.shape[0]
-    binary = (bow_matrix > 0).astype(np.float32)
-    if sp.issparse(binary):
-        binary = binary.toarray()
+    if len(topics) < 2:
+        return 1.0
 
-    word2idx = {w: i for i, w in enumerate(vocab)}
-    doc_freq = binary.sum(axis=0).flatten()
+    K = len(topics)
+    topic_word_sets = [set(t.words[:top_n]) for t in topics]
 
-    coherences = []
-    for topic in topics:
-        words = topic.words[:top_n]
-        indices = [word2idx[w] for w in words if w in word2idx]
-        if len(indices) < 2:
+    tr_per_topic = []
+    for k in range(K):
+        words_k = topic_word_sets[k]
+        n_words = len(words_k)
+        if n_words == 0:
+            tr_per_topic.append(0.0)
             continue
 
-        pairs_npmi = []
-        for i in range(len(indices)):
-            for j in range(i + 1, len(indices)):
-                wi, wj = indices[i], indices[j]
-                df_i = doc_freq[wi]
-                df_j = doc_freq[wj]
-                df_ij = (binary[:, wi] * binary[:, wj]).sum()
+        # Count how many of topic k's words appear in other topics
+        overlap_count = 0
+        for w in words_k:
+            for j in range(K):
+                if j != k and w in topic_word_sets[j]:
+                    overlap_count += 1
 
-                if df_ij == 0 or df_i == 0 or df_j == 0:
-                    pairs_npmi.append(-1.0)
-                else:
-                    p_ij = df_ij / n_docs
-                    p_i = df_i / n_docs
-                    p_j = df_j / n_docs
-                    pmi = np.log(p_ij / (p_i * p_j) + 1e-12)
-                    npmi = pmi / (-np.log(p_ij) + 1e-12)
-                    pairs_npmi.append(float(npmi))
+        # TR(k) = overlap_count / (N x (K-1))
+        tr_k = overlap_count / (n_words * (K - 1))
+        tr_per_topic.append(tr_k)
 
-        if pairs_npmi:
-            coherences.append(np.mean(pairs_npmi))
-
-    return float(np.mean(coherences)) if coherences else 0.0
+    avg_tr = np.mean(tr_per_topic)
+    td = 1.0 - avg_tr
+    return float(td)
 
 
-# ─── Topic Diversity ──────────────────────────────────────────────────────────
+# --- IRBO --- Inverted Rank-Biased Overlap (from SubNTM) ---
 
-def compute_topic_diversity(topics: list[Topic], top_n: int = 15) -> float:
-    """Topic Diversity (TD) = 1 - Topic Repetition Rate (TR).
+def _rbo_score(list1: list[str], list2: list[str], p: float = 0.9) -> float:
+    """Rank-Biased Overlap (RBO) extrapolated estimate between two ranked lists.
 
-    From the paper (Section 4.1):
-        TR = 1 - |unique words in top-m across all topics| / (T × m)
-        TD = 1 - TR = |unique words| / (T × m)
-
-    Higher TD means less redundancy across topics.
+    Simplified implementation following SubNTM/evaluations/irbo.py.
     """
-    all_words = []
-    for t in topics:
-        all_words.extend(t.words[:top_n])
-    if len(all_words) == 0:
+    k = min(len(list1), len(list2))
+    if k == 0:
         return 0.0
-    return len(set(all_words)) / len(all_words)
+
+    sum_val = 0.0
+    for d in range(1, k + 1):
+        set1 = set(list1[:d])
+        set2 = set(list2[:d])
+        intersection = len(set1 & set2)
+        total = len(set1) + len(set2)
+        agreement = 2 * intersection / total if total > 0 else 0
+        sum_val += p ** d * agreement
+
+    return (1 - p) * sum_val
 
 
-# ─── Topic Quality ────────────────────────────────────────────────────────────
+def compute_irbo(topics: list[Topic], top_n: int = 15, weight: float = 0.9) -> float:
+    """Inverted Rank-Biased Overlap (IRBO) for topic diversity.
+
+    From SubNTM: IRBO = 1 - mean(RBO(topic_i, topic_j)) for all pairs.
+    Higher IRBO means more diverse topics.
+
+    Args:
+        topics: list of Topic objects
+        top_n: number of top words per topic
+        weight: RBO weight parameter p (default 0.9)
+    """
+    if len(topics) < 2:
+        return 1.0
+
+    top_word_lists = [t.words[:top_n] for t in topics]
+    scores = []
+    for list1, list2 in itertools.combinations(top_word_lists, 2):
+        rbo_val = _rbo_score(list1, list2, p=weight)
+        scores.append(rbo_val)
+
+    return 1.0 - float(np.mean(scores))
+
+
+# --- Topic Quality (TQ) ---
 
 def compute_topic_quality(
     tc: float,
@@ -211,62 +275,74 @@ def compute_topic_quality(
     n_topics: int,
     max_topics: int,
 ) -> float:
-    """Topic Quality (TQ) = TC × TD × (T / T_max).
+    """Topic Quality (TQ) = TC x TD x (T / T_max).
 
     From the paper (Section 4.1):
-        TQ_t = TC_t × TD_t × (T_t / T_max)
-    where T_t is the number of non-trivial topics at timestamp t
-    and T_max is the maximum possible (e.g. n_topics = 50).
+        TQ_t = TC_t x TD_t x (T_t / T_max_t)
+    where T_t is the number of topics at timestamp t
+    and T_max_t is the maximum number of topics across all timestamps.
 
     Args:
-        tc: topic coherence (NPMI)
-        td: topic diversity
-        n_topics: number of non-trivial topics at this timestamp
-        max_topics: maximum possible topics (T_max)
+        tc: topic coherence (NPMI) at this timestamp
+        td: topic diversity at this timestamp
+        n_topics: number of topics at this timestamp
+        max_topics: maximum topics (T_max)
     """
     return tc * td * (n_topics / max_topics)
 
 
-# ─── Temporal Topic Smoothness (TTS) ─────────────────────────────────────────
+# --- Temporal Topic Smoothness (TTS) ---
 
 def compute_tts(
-    beta_list: list[np.ndarray],
+    topics_per_ts: list[list[Topic]],
+    top_n: int = 15,
 ) -> float:
     """Temporal Topic Smoothness (TTS).
 
-    From the paper (Section 4.1):
-        TTS = (1/(T-1)) Σ_{t=1}^{T-1} avg_k cos_sim(β_k^t, β_k^{t+1})
+    From Karakkaparambil James et al. (2024), as used in the paper (Table 2):
+    TTS measures whether topic transitions are abrupt or gradual.
+    The paper reports TTS ~ 0.368 for NIPS (CoNTM), indicating moderate change.
 
-    Measures how smoothly topics evolve across consecutive timestamps.
-    Higher TTS means more stable/smooth topic evolution.
+    We compute TTS as the average pairwise Jaccard similarity between
+    the top-word sets of matched topics across consecutive timestamps.
+    This produces values in [0, 1] where ~0.5 indicates balanced transitions
+    (topics evolve but don't change completely).
 
     Args:
-        beta_list: list of (n_topics, vocab_size) topic-word distributions,
-                   one per timestamp in chronological order.
+        topics_per_ts: list of topic lists, one per timestamp in chronological order.
+        top_n: number of top words per topic to consider.
 
     Returns:
-        Average cosine similarity between matched topics across consecutive timestamps.
+        Average Jaccard-based smoothness across consecutive timestamps.
     """
-    if len(beta_list) < 2:
+    if len(topics_per_ts) < 2:
         return 0.0
 
     smoothness_scores = []
-    for t in range(len(beta_list) - 1):
-        beta_t = beta_list[t]      # (K, V)
-        beta_next = beta_list[t + 1]  # (K, V)
+    for t in range(len(topics_per_ts) - 1):
+        topics_t = topics_per_ts[t]
+        topics_next = topics_per_ts[t + 1]
 
-        # Normalize rows to unit vectors for cosine similarity
-        norm_t = beta_t / (np.linalg.norm(beta_t, axis=1, keepdims=True) + 1e-12)
-        norm_next = beta_next / (np.linalg.norm(beta_next, axis=1, keepdims=True) + 1e-12)
+        K = min(len(topics_t), len(topics_next))
+        if K == 0:
+            continue
 
-        # Per-topic cosine similarity (matched by index)
-        cos_sim = (norm_t * norm_next).sum(axis=1)  # (K,)
-        smoothness_scores.append(cos_sim.mean())
+        # Per-topic Jaccard similarity (matched by index k)
+        jaccard_scores = []
+        for k in range(K):
+            set_t = set(topics_t[k].words[:top_n])
+            set_next = set(topics_next[k].words[:top_n])
+            intersection = len(set_t & set_next)
+            union = len(set_t | set_next)
+            jaccard = intersection / union if union > 0 else 0.0
+            jaccard_scores.append(jaccard)
+
+        smoothness_scores.append(np.mean(jaccard_scores))
 
     return float(np.mean(smoothness_scores))
 
 
-# ─── Predictive Perplexity ────────────────────────────────────────────────────
+# --- Predictive Perplexity (PPL) ---
 
 def compute_perplexity(
     model,
@@ -276,9 +352,8 @@ def compute_perplexity(
 ) -> float:
     """Predictive perplexity on held-out documents.
 
-    From the paper (Section 4.1):
-        PPL = exp( -Σ_d log p(d) / Σ_d N_d )
-    where p(d) is the reconstructed probability and N_d is the total word count.
+    From the paper (Section 4.1 / Appendix L):
+        PPL = exp( -Sum_d log p(d) / Sum_d N_d )
 
     The model trained at timestamp t is used to predict documents at timestamp t+1.
     Lower perplexity is better.
@@ -286,7 +361,7 @@ def compute_perplexity(
     Args:
         model: trained ProdLDA model
         test_loader: DataLoader for test documents
-        global_beta: optional global topic-word logits
+        global_beta: optional global topic-word logits (post-update phi_global)
         device: compute device
 
     Returns:
@@ -305,20 +380,20 @@ def compute_perplexity(
     with torch.no_grad():
         for batch in test_loader:
             batch = batch.to(device)
-            output = model(batch, global_beta, kl_weight=0.0)  # only recon
 
-            # Log-likelihood per document
-            # Reconstruction gives log p(w|d) via log_softmax
-            # We need p(d) = Π_w p(w|d)^count(w)
+            # Normalize BoW
             x_norm = batch / (batch.sum(dim=1, keepdim=True) + 1e-12)
-            # Forward pass to get log-probabilities
+
+            # Encode
             mu, log_var = model.encoder(x_norm)
             theta = model.reparameterize(mu, log_var)
+
+            # Decode to get log p(w|d)
             log_recon = model.decoder(theta, global_beta)
 
-            # log p(d) = Σ_w count(w) * log p(w|d)
-            log_probs = (batch * log_recon).sum(dim=1)  # (batch_size,)
-            word_counts = batch.sum(dim=1)  # (batch_size,)
+            # log p(d) = Sum_w count(w) x log p(w|d)
+            log_probs = (batch * log_recon).sum(dim=1)
+            word_counts = batch.sum(dim=1)
 
             total_log_likelihood += log_probs.sum().item()
             total_words += word_counts.sum().item()
@@ -332,7 +407,7 @@ def compute_perplexity(
     return float(perplexity)
 
 
-# ─── Summary ──────────────────────────────────────────────────────────────────
+# --- Summary / IO ---
 
 def print_topics(topics: list[Topic], label: str = "") -> None:
     """Pretty-print topics to stdout."""

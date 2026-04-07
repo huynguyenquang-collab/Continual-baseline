@@ -36,6 +36,7 @@ from .topic_utils import (
     extract_topics,
     compute_npmi,
     compute_topic_diversity,
+    compute_irbo,
     compute_topic_quality,
     compute_tts,
     compute_perplexity,
@@ -114,7 +115,7 @@ def run_contm(
 
     # ── Storage ──
     results_per_ts = {}
-    all_beta_dists = []      # for TTS computation
+    all_topics_list = []     # ordered list of topics per timestamp for TTS
     all_topics_per_ts = {}   # for final output
 
     for t_idx, ts in enumerate(timestamps):
@@ -179,19 +180,23 @@ def run_contm(
         # ── Extract topics (Algorithm 2, line 10) ──
         topics = extract_topics(local_beta_dist, vocab, top_m=top_m, source=f"T{ts}")
         all_topics_per_ts[ts] = topics
-        all_beta_dists.append(local_beta_dist)
+        all_topics_list.append(topics)
 
-        # ── Evaluate: NPMI ──
-        ref_docs = get_reference_corpus(corpus, ts, window=-1)
+        # ── Evaluate: NPMI (temporal reference corpus = all docs up to t) ──
+        ref_docs = get_reference_corpus(corpus, ts, window=t_idx)
         tc = compute_npmi(topics, ref_docs, top_n=npmi_top_n)
 
-        # ── Evaluate: Topic Diversity ──
+        # ── Evaluate: Topic Diversity (Burkhardt & Kramer TR) ──
         td = compute_topic_diversity(topics, top_n=top_m)
+
+        # ── Evaluate: IRBO (from SubNTM) ──
+        irbo = compute_irbo(topics, top_n=top_m)
 
         # ── Evaluate: Topic Quality ──
         tq = compute_topic_quality(tc, td, n_topics, n_topics)
 
         # ── Evaluate: Predictive Perplexity (predict next timestamp) ──
+        # Use the post-update global_beta for prediction (Algorithm 2 line 9 done)
         ppl = None
         if t_idx + 1 < T:
             next_ts = timestamps[t_idx + 1]
@@ -199,12 +204,16 @@ def run_contm(
                 next_test_loader = make_dataloader(
                     corpus.test_data[next_ts], batch_size=batch_size, shuffle=False
                 )
-                ppl = compute_perplexity(model, next_test_loader, global_beta_tensor, device)
+                # Use current (post-update) global beta for PPL
+                post_gb = global_memory.get_global_beta_logits()
+                post_gb_tensor = torch.from_numpy(post_gb).float()
+                ppl = compute_perplexity(model, next_test_loader, post_gb_tensor, device)
 
         # ── Print summary ──
         print(f"\n  Results for T{ts} ({ts_label}):")
         print(f"    TC (NPMI):   {tc:.4f}")
         print(f"    TD:          {td:.4f}")
+        print(f"    IRBO:        {irbo:.4f}")
         print(f"    TQ:          {tq:.4f}")
         if ppl is not None:
             print(f"    PPL (next):  {ppl:.2f}")
@@ -226,6 +235,7 @@ def run_contm(
             "n_docs": corpus.train_data[ts].n_docs,
             "tc": tc,
             "td": td,
+            "irbo": irbo,
             "tq": tq,
             "ppl": ppl,
             "rho": rho,
@@ -234,12 +244,13 @@ def run_contm(
             "final_epoch": train_result["final_epoch"],
         }
 
-    # ── Compute TTS (temporal topic smoothness) ──
-    tts = compute_tts(all_beta_dists)
+    # ── Compute TTS (temporal topic smoothness via Jaccard on top words) ──
+    tts = compute_tts(all_topics_list, top_n=top_m)
 
     # ── Aggregate metrics ──
     tc_values = [r["tc"] for r in results_per_ts.values()]
     td_values = [r["td"] for r in results_per_ts.values()]
+    irbo_values = [r["irbo"] for r in results_per_ts.values()]
     tq_values = [r["tq"] for r in results_per_ts.values()]
     ppl_values = [r["ppl"] for r in results_per_ts.values() if r["ppl"] is not None]
 
@@ -251,6 +262,7 @@ def run_contm(
         "tau0": tau0,
         "avg_tc": float(np.mean(tc_values)),
         "avg_td": float(np.mean(td_values)),
+        "avg_irbo": float(np.mean(irbo_values)),
         "avg_tq": float(np.mean(tq_values)),
         "tts": tts,
         "avg_ppl": float(np.mean(ppl_values)) if ppl_values else None,
@@ -263,6 +275,7 @@ def run_contm(
     print(f"{'=' * 70}")
     print(f"  Avg TC (NPMI):  {summary['avg_tc']:.4f}")
     print(f"  Avg TD:         {summary['avg_td']:.4f}")
+    print(f"  Avg IRBO:       {summary['avg_irbo']:.4f}")
     print(f"  Avg TQ:         {summary['avg_tq']:.4f}")
     print(f"  TTS:            {summary['tts']:.4f}")
     if summary["avg_ppl"] is not None:
