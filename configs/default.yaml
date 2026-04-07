@@ -14,8 +14,10 @@ lr: 0.01                  # learning rate (Adam)
 weight_decay: 1.0e-6      # L2 regularization
 epochs: 100               # max epochs per timestamp
 kl_warmup_epochs: 20      # linearly anneal KL weight from 0 to 1
-patience: 10              # early stopping patience (on validation/train loss)
+patience: 10              # early stopping patience (on validation loss)
 batch_size: 256           # mini-batch size
+alpha: 0.90               # early stopping: alpha*val_loss + (1-alpha)*val_ppl
+                          # (see paper Appendix L, Figures 19-20)
 
 # ── Global Memory ──
 kappa: 0.7                # κ — decay exponent for ρ_t = 1/(τ₀+t)^κ

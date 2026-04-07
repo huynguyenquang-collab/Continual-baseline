@@ -105,14 +105,16 @@ def main():
                         help="Path to papers.csv")
     parser.add_argument("--output-dir", default="data/NIPS",
                         help="Output directory")
-    parser.add_argument("--min-para-words", type=int, default=15,
-                        help="Min words per paragraph")
+    parser.add_argument("--min-para-words", type=int, default=40,
+                        help="Min words per paragraph (paper gets ~276K docs with 40)")
     parser.add_argument("--min-df", type=float, default=0.0005,
                         help="min_df for CountVectorizer (fraction)")
     parser.add_argument("--max-df", type=float, default=0.95,
                         help="max_df for CountVectorizer (fraction)")
     parser.add_argument("--test-size", type=float, default=0.1,
                         help="Test set fraction")
+    parser.add_argument("--val-size", type=float, default=0.1,
+                        help="Validation set fraction (paper uses 0.1)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -174,28 +176,42 @@ def main():
     original_texts = [original_texts[i] for i in nonzero]
     print(f"  After vocab filter: {bow.shape[0]} docs")
 
-    # ── Step 4: Train/Test split ──────────────────────────────────────────────
-    print(f"\nStep 4: Train/test split ({1-args.test_size:.0%}/{args.test_size:.0%})...")
+    # ── Step 4: Train/Val/Test split ──────────────────────────────────────────
+    # Paper Section 4.3: "80% training set, 10% validation set, 10% test set"
+    print(f"\nStep 4: Train/val/test split ({1-args.test_size-args.val_size:.0%}/{args.val_size:.0%}/{args.test_size:.0%})...")
     from sklearn.model_selection import train_test_split
 
     indices = np.arange(bow.shape[0])
-    train_idx, test_idx = train_test_split(
+
+    # First split: train+val vs test
+    trainval_idx, test_idx = train_test_split(
         indices, test_size=args.test_size, random_state=42, stratify=timestamps
     )
 
+    # Second split: train vs val (from trainval)
+    trainval_timestamps = [timestamps[i] for i in trainval_idx]
+    val_fraction = args.val_size / (1.0 - args.test_size)  # e.g. 0.1/0.9 ≈ 0.111
+    train_idx, val_idx = train_test_split(
+        trainval_idx, test_size=val_fraction, random_state=42, stratify=trainval_timestamps
+    )
+
     train_bow = bow[train_idx]
+    val_bow = bow[val_idx]
     test_bow = bow[test_idx]
     train_times = [timestamps[i] for i in train_idx]
+    val_times = [timestamps[i] for i in val_idx]
     test_times = [timestamps[i] for i in test_idx]
     train_texts = [original_texts[i] for i in train_idx]
+    val_texts = [original_texts[i] for i in val_idx]
     test_texts = [original_texts[i] for i in test_idx]
-    print(f"  Train: {train_bow.shape[0]}, Test: {test_bow.shape[0]}")
+    print(f"  Train: {train_bow.shape[0]}, Val: {val_bow.shape[0]}, Test: {test_bow.shape[0]}")
 
     # ── Step 5: Save ──────────────────────────────────────────────────────────
     print(f"\nStep 5: Saving to {args.output_dir}/...")
     from scipy import sparse
 
     sparse.save_npz(os.path.join(args.output_dir, "train_bow.npz"), train_bow)
+    sparse.save_npz(os.path.join(args.output_dir, "val_bow.npz"), val_bow)
     sparse.save_npz(os.path.join(args.output_dir, "test_bow.npz"), test_bow)
 
     with open(os.path.join(args.output_dir, "vocab.txt"), "w") as f:
@@ -204,11 +220,17 @@ def main():
     with open(os.path.join(args.output_dir, "train_times.txt"), "w") as f:
         f.writelines(str(t) + "\n" for t in train_times)
 
+    with open(os.path.join(args.output_dir, "val_times.txt"), "w") as f:
+        f.writelines(str(t) + "\n" for t in val_times)
+
     with open(os.path.join(args.output_dir, "test_times.txt"), "w") as f:
         f.writelines(str(t) + "\n" for t in test_times)
 
     with open(os.path.join(args.output_dir, "train_texts.txt"), "w") as f:
         f.writelines(t.replace("\n", " ") + "\n" for t in train_texts)
+
+    with open(os.path.join(args.output_dir, "val_texts.txt"), "w") as f:
+        f.writelines(t.replace("\n", " ") + "\n" for t in val_texts)
 
     with open(os.path.join(args.output_dir, "test_texts.txt"), "w") as f:
         f.writelines(t.replace("\n", " ") + "\n" for t in test_texts)
@@ -218,6 +240,7 @@ def main():
             f.write(f"{i}\t{lo}-{hi}\n")
 
     np.savetxt(os.path.join(args.output_dir, "train_idx.txt"), train_idx, fmt="%d")
+    np.savetxt(os.path.join(args.output_dir, "val_idx.txt"), val_idx, fmt="%d")
     np.savetxt(os.path.join(args.output_dir, "test_idx.txt"), test_idx, fmt="%d")
 
     # ── Summary ───────────────────────────────────────────────────────────────
@@ -225,7 +248,7 @@ def main():
     print("PREPROCESSING COMPLETE")
     print(f"{'=' * 60}")
     print(f"  Documents: {bow.shape[0]}  |  Vocab: {len(vocab)}  |  Timestamps: {len(set(timestamps))}")
-    print(f"  Train: {train_bow.shape[0]}  |  Test: {test_bow.shape[0]}")
+    print(f"  Train: {train_bow.shape[0]}  |  Val: {val_bow.shape[0]}  |  Test: {test_bow.shape[0]}")
 
 
 if __name__ == "__main__":

@@ -76,15 +76,18 @@ class ProdLDADecoder(nn.Module):
 
     The softmax is applied AFTER multiplying θ·β (product of experts).
     Uses BatchNorm on the pre-softmax logits for stability.
+
+    IMPORTANT: Δϕ_local_t is initialized to ZERO (Algorithm 2, line 3).
     """
 
     def __init__(self, vocab_size: int, n_topics: int):
         super().__init__()
         # Local delta topic-word logits Δϕ_local_t
         self.topic_word_logits = nn.Linear(n_topics, vocab_size, bias=False)
+        # Initialize Δϕ_local_t = 0 (Algorithm 2, line 3)
+        nn.init.zeros_(self.topic_word_logits.weight)
         # BN on pre-softmax logits (critical for ProdLDA stability)
         self.bn = nn.BatchNorm1d(vocab_size, affine=True)
-        self.drop = nn.Dropout(0.1)
 
     def forward(self, theta: torch.Tensor, global_beta: Optional[torch.Tensor] = None):
         """
@@ -106,7 +109,6 @@ class ProdLDADecoder(nn.Module):
         # θ · β_logits → (batch, vocab_size) unnormalized scores
         logits = torch.mm(theta, combined)  # (batch, vocab_size)
         logits = self.bn(logits)
-        logits = self.drop(logits)
 
         # Log-softmax for numerical stability (product of experts)
         log_recon = F.log_softmax(logits, dim=-1)
@@ -220,9 +222,34 @@ class ProdLDA(nn.Module):
 
 # ─── Training Loop ───────────────────────────────────────────────────────────
 
+def _compute_val_ppl(model, val_loader, global_beta, device):
+    """Compute perplexity on validation set (used for alpha-based early stopping).
+
+    PPL = exp(-sum log p(d) / sum N_d)
+    """
+    model.eval()
+    total_ll = 0.0
+    total_words = 0.0
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = batch.to(device)
+            x_norm = batch / (batch.sum(dim=1, keepdim=True) + 1e-12)
+            mu, log_var = model.encoder(x_norm)
+            theta = model.reparameterize(mu, log_var)
+            log_recon = model.decoder(theta, global_beta)
+            log_probs = (batch * log_recon).sum(dim=1)
+            total_ll += log_probs.sum().item()
+            total_words += batch.sum(dim=1).sum().item()
+    if total_words == 0:
+        return float("inf")
+    avg_nll = -total_ll / total_words
+    return float(np.exp(min(avg_nll, 500)))
+
+
 def train_vae(
     model: ProdLDA,
     train_loader,
+    val_loader=None,
     test_loader=None,
     global_beta: Optional[torch.Tensor] = None,
     epochs: int = 100,
@@ -230,6 +257,7 @@ def train_vae(
     weight_decay: float = 1e-6,
     kl_warmup_epochs: int = 20,
     patience: int = 10,
+    alpha: float = 0.9,
     device: str = "cpu",
 ) -> dict:
     """Train ProdLDA on a single timestamp's data (Algorithm 2, lines 5-8).
@@ -238,16 +266,23 @@ def train_vae(
     global beta logits frozen. Only the encoder θ and local delta Δϕ_local
     are optimized via gradient descent on the ELBO.
 
+    Early stopping is based on the validation set (paper Section 4.3):
+        monitor = alpha * val_loss + (1 - alpha) * val_ppl
+    where alpha controls the trade-off between ELBO loss and predictive perplexity.
+    (Appendix L, Figures 19/20)
+
     Args:
         model: ProdLDA instance (freshly initialized for this timestamp)
         train_loader: DataLoader yielding (batch, vocab_size) BoW tensors
-        test_loader: optional DataLoader for validation/early stopping
+        val_loader: DataLoader for validation/early stopping (paper: 10% of data)
+        test_loader: DataLoader for test set (not used for early stopping)
         global_beta: (n_topics, vocab_size) frozen global logits from previous timestamps
         epochs: max training epochs
         lr: learning rate (paper uses 0.01)
         weight_decay: L2 regularization
         kl_warmup_epochs: number of epochs to linearly anneal KL weight from 0→1
         patience: early stopping patience
+        alpha: trade-off for early stopping: alpha*val_loss + (1-alpha)*val_ppl
         device: "cpu" or "cuda"
 
     Returns:
@@ -264,7 +299,7 @@ def train_vae(
     best_state = None
     wait = 0
     history = {"train_loss": [], "train_recon": [], "train_kl": [],
-               "test_loss": [], "kl_weight": []}
+               "val_loss": [], "test_loss": [], "kl_weight": []}
 
     for epoch in range(1, epochs + 1):
         # KL annealing: linearly increase KL weight from 0 to 1
@@ -299,7 +334,24 @@ def train_vae(
         history["train_recon"].append(avg_recon)
         history["train_kl"].append(avg_kl)
 
-        # ── Validation ──
+        # ── Validation (for early stopping, paper uses val set) ──
+        val_loss = None
+        if val_loader is not None:
+            model.eval()
+            total_val = 0.0
+            n_val = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = batch.to(device)
+                    output = model(batch, global_beta, kl_weight=1.0)
+                    total_val += output.loss.item()
+                    n_val += 1
+            val_loss = total_val / n_val
+            history["val_loss"].append(val_loss)
+        else:
+            history["val_loss"].append(None)
+
+        # ── Test (separate, not for early stopping) ──
         test_loss = None
         if test_loader is not None:
             model.eval()
@@ -316,7 +368,14 @@ def train_vae(
         else:
             history["test_loss"].append(None)
 
-        monitor_loss = test_loss if test_loss is not None else avg_loss
+        # Monitor loss: use val if available, else train
+        # Paper (Appendix L, Figures 19-20): alpha * val_loss + (1-alpha) * val_ppl
+        if val_loader is not None and val_loss is not None:
+            # Compute validation perplexity for alpha-weighted stopping
+            val_ppl = _compute_val_ppl(model, val_loader, global_beta, device)
+            monitor_loss = alpha * val_loss + (1 - alpha) * val_ppl
+        else:
+            monitor_loss = avg_loss
         scheduler.step(monitor_loss)
 
         # Early stopping
@@ -329,8 +388,10 @@ def train_vae(
 
         if epoch % 10 == 0 or epoch == 1 or wait == 0:
             msg = f"  Epoch {epoch:3d} | Loss {avg_loss:.2f} (recon {avg_recon:.2f} + kl {avg_kl:.2f} * {kl_weight:.2f})"
+            if val_loss is not None:
+                msg += f" | Val {val_loss:.2f}"
             if test_loss is not None:
-                msg += f" | Val {test_loss:.2f}"
+                msg += f" | Test {test_loss:.2f}"
             if wait == 0:
                 msg += " *"
             print(msg)

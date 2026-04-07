@@ -43,12 +43,13 @@ class TimestampData:
 
 @dataclass
 class Corpus:
-    """Full corpus with train/test splits and per-timestamp access."""
+    """Full corpus with train/val/test splits and per-timestamp access."""
     vocab: list[str]
     vocab_size: int
     timestamps: list[int]                      # sorted unique timestamp ids
     time_labels: dict[int, str]                # timestamp_id → human label
     train_data: dict[int, TimestampData]       # timestamp_id → TimestampData
+    val_data: Optional[dict[int, TimestampData]] = None
     test_data: Optional[dict[int, TimestampData]] = None
 
 
@@ -105,6 +106,14 @@ def load_corpus(data_dir: str) -> Corpus:
         test_bow = sp.load_npz(str(test_bow_path))
         test_times = np.loadtxt(str(test_times_path), dtype=int)
 
+    # Val BoW + timestamps (optional — paper uses 80/10/10 split)
+    val_bow_path = data_dir / "val_bow.npz"
+    val_times_path = data_dir / "val_times.txt"
+    has_val = val_bow_path.exists() and val_times_path.exists()
+    if has_val:
+        val_bow = sp.load_npz(str(val_bow_path))
+        val_times = np.loadtxt(str(val_times_path), dtype=int)
+
     # Group documents by timestamp
     unique_ts = sorted(set(train_times.tolist()))
 
@@ -129,8 +138,21 @@ def load_corpus(data_dir: str) -> Corpus:
                     label=time_labels.get(ts, str(ts)),
                 )
 
+    val_data: Optional[dict[int, TimestampData]] = None
+    if has_val:
+        val_data = {}
+        for ts in unique_ts:
+            mask = val_times == ts
+            if mask.sum() > 0:
+                val_data[ts] = TimestampData(
+                    timestamp=ts,
+                    bow=val_bow[mask],
+                    label=time_labels.get(ts, str(ts)),
+                )
+
     print(f"Loaded corpus: {vocab_size} vocab, {len(unique_ts)} timestamps, "
           f"{train_bow.shape[0]} train docs"
+          + (f", {val_bow.shape[0]} val docs" if has_val else "")
           + (f", {test_bow.shape[0]} test docs" if has_test else ""))
 
     return Corpus(
@@ -139,6 +161,7 @@ def load_corpus(data_dir: str) -> Corpus:
         timestamps=unique_ts,
         time_labels=time_labels,
         train_data=train_data,
+        val_data=val_data,
         test_data=test_data,
     )
 

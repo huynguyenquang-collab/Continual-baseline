@@ -38,7 +38,9 @@ from .topic_utils import (
     compute_topic_diversity,
     compute_irbo,
     compute_topic_quality,
+    compute_topic_quality_paper,
     compute_tts,
+    compute_tts_paper,
     compute_perplexity,
     print_topics,
     save_topics,
@@ -56,6 +58,7 @@ def run_contm(
     kl_warmup_epochs: int = 20,
     patience: int = 10,
     batch_size: int = 256,
+    alpha: float = 0.9,
     kappa: float = 0.7,
     tau0: float = 1.0,
     top_m: int = 15,
@@ -101,7 +104,7 @@ def run_contm(
 
     print(f"\n{'=' * 70}")
     print(f" CoNTM: {T} timestamps, {n_topics} topics, V={vocab_size}")
-    print(f" Hyperparams: κ={kappa}, τ₀={tau0}, lr={lr}, hidden={enc_hidden}")
+    print(f" Hyperparams: κ={kappa}, τ₀={tau0}, lr={lr}, hidden={enc_hidden}, α={alpha}")
     print(f" Device: {device}")
     print(f"{'=' * 70}\n")
 
@@ -131,6 +134,13 @@ def run_contm(
         train_loader = make_dataloader(
             corpus.train_data[ts], batch_size=batch_size, shuffle=True
         )
+        # Validation set for early stopping (paper Section 4.3: 10% val)
+        val_loader = None
+        if corpus.val_data and ts in corpus.val_data:
+            val_loader = make_dataloader(
+                corpus.val_data[ts], batch_size=batch_size, shuffle=False
+            )
+        # Test set (separate, NOT used for early stopping)
         test_loader = None
         if corpus.test_data and ts in corpus.test_data:
             test_loader = make_dataloader(
@@ -158,6 +168,7 @@ def run_contm(
         train_result = train_vae(
             model=model,
             train_loader=train_loader,
+            val_loader=val_loader,
             test_loader=test_loader,
             global_beta=global_beta_tensor,
             epochs=epochs,
@@ -165,6 +176,7 @@ def run_contm(
             weight_decay=weight_decay,
             kl_warmup_epochs=kl_warmup_epochs,
             patience=patience,
+            alpha=alpha,
             device=device,
         )
         train_time = time.time() - t_start
@@ -244,8 +256,9 @@ def run_contm(
             "final_epoch": train_result["final_epoch"],
         }
 
-    # ── Compute TTS (temporal topic smoothness via Jaccard on top words) ──
+    # ── Compute TTS (temporal topic smoothness) ──
     tts = compute_tts(all_topics_list, top_n=top_m)
+    tts_paper = compute_tts_paper(all_topics_list, top_n=top_m)
 
     # ── Aggregate metrics ──
     tc_values = [r["tc"] for r in results_per_ts.values()]
@@ -253,6 +266,9 @@ def run_contm(
     irbo_values = [r["irbo"] for r in results_per_ts.values()]
     tq_values = [r["tq"] for r in results_per_ts.values()]
     ppl_values = [r["ppl"] for r in results_per_ts.values() if r["ppl"] is not None]
+
+    # Paper's overall TQ (should be same as avg_tq when T_i = T_max for all i)
+    tq_paper = compute_topic_quality_paper(tc_values, td_values, n_topics, n_topics)
 
     summary = {
         "n_timestamps": T,
@@ -264,7 +280,9 @@ def run_contm(
         "avg_td": float(np.mean(td_values)),
         "avg_irbo": float(np.mean(irbo_values)),
         "avg_tq": float(np.mean(tq_values)),
+        "tq_paper": tq_paper,
         "tts": tts,
+        "tts_paper": tts_paper,
         "avg_ppl": float(np.mean(ppl_values)) if ppl_values else None,
         "per_timestamp": {str(k): v for k, v in results_per_ts.items()},
     }
@@ -277,7 +295,9 @@ def run_contm(
     print(f"  Avg TD:         {summary['avg_td']:.4f}")
     print(f"  Avg IRBO:       {summary['avg_irbo']:.4f}")
     print(f"  Avg TQ:         {summary['avg_tq']:.4f}")
-    print(f"  TTS:            {summary['tts']:.4f}")
+    print(f"  TQ (paper):     {summary['tq_paper']:.4f}")
+    print(f"  TTS (Jaccard):  {summary['tts']:.4f}")
+    print(f"  TTS (paper):    {summary['tts_paper']:.4f}")
     if summary["avg_ppl"] is not None:
         print(f"  Avg PPL:        {summary['avg_ppl']:.2f}")
     print()

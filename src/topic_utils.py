@@ -282,6 +282,9 @@ def compute_topic_quality(
     where T_t is the number of topics at timestamp t
     and T_max_t is the maximum number of topics across all timestamps.
 
+    The paper's overall TQ is the average over all timestamps:
+        TQ = (1/k) sum_{i=0}^{k-1} TQ_i
+
     Args:
         tc: topic coherence (NPMI) at this timestamp
         td: topic diversity at this timestamp
@@ -291,22 +294,35 @@ def compute_topic_quality(
     return tc * td * (n_topics / max_topics)
 
 
+def compute_topic_quality_paper(
+    tc_values: list[float],
+    td_values: list[float],
+    n_topics: int,
+    max_topics: int,
+) -> float:
+    """Paper's overall TQ formula (Section 4.1):
+        TQ = (1/k) sum_{i=0}^{k-1} TC_i x TD_i x (T_i / T_max_i)
+
+    This is equivalent to averaging per-timestamp TQ when T_i = max_topics
+    for all timestamps (as in our case with K=50 fixed).
+    """
+    if not tc_values:
+        return 0.0
+    k = len(tc_values)
+    ratio = n_topics / max_topics
+    return sum(tc * td * ratio for tc, td in zip(tc_values, td_values)) / k
+
+
 # --- Temporal Topic Smoothness (TTS) ---
 
 def compute_tts(
     topics_per_ts: list[list[Topic]],
     top_n: int = 15,
 ) -> float:
-    """Temporal Topic Smoothness (TTS).
+    """Temporal Topic Smoothness (TTS) — Jaccard variant.
 
-    From Karakkaparambil James et al. (2024), as used in the paper (Table 2):
-    TTS measures whether topic transitions are abrupt or gradual.
-    The paper reports TTS ~ 0.368 for NIPS (CoNTM), indicating moderate change.
-
-    We compute TTS as the average pairwise Jaccard similarity between
-    the top-word sets of matched topics across consecutive timestamps.
-    This produces values in [0, 1] where ~0.5 indicates balanced transitions
-    (topics evolve but don't change completely).
+    Uses Jaccard similarity between matched topics across consecutive timestamps.
+    This is our original implementation (not the exact paper formula).
 
     Args:
         topics_per_ts: list of topic lists, one per timestamp in chronological order.
@@ -340,6 +356,50 @@ def compute_tts(
         smoothness_scores.append(np.mean(jaccard_scores))
 
     return float(np.mean(smoothness_scores))
+
+
+def compute_tts_paper(
+    topics_per_ts: list[list[Topic]],
+    top_n: int = 15,
+) -> float:
+    """Temporal Topic Smoothness (TTS) — Paper version.
+
+    From Karakkaparambil James et al. (2024) "Evaluating Dynamic Topic Models":
+        TTS(k, t, t+1) = |top_n(k,t) ∩ top_n(k,t+1)| / n
+
+    Topics are matched by index. Final TTS is averaged over all topics and
+    all consecutive timestamp pairs.
+
+    This is the EXACT formula from the paper:
+        TTS = (1/K) Σ_k (1/(T-1)) Σ_t overlap(k,t,t+1) / n
+
+    Args:
+        topics_per_ts: list of topic lists, one per timestamp in chronological order.
+        top_n: number of top words per topic to consider.
+
+    Returns:
+        Average overlap-based smoothness in [0, 1].
+    """
+    if len(topics_per_ts) < 2:
+        return 0.0
+
+    T = len(topics_per_ts)
+    K = min(len(ts_topics) for ts_topics in topics_per_ts)
+    if K == 0:
+        return 0.0
+
+    # Per-topic smoothness averaged over time pairs
+    per_topic_smoothness = []
+    for k in range(K):
+        pair_scores = []
+        for t in range(T - 1):
+            set_t = set(topics_per_ts[t][k].words[:top_n])
+            set_next = set(topics_per_ts[t + 1][k].words[:top_n])
+            overlap = len(set_t & set_next) / top_n
+            pair_scores.append(overlap)
+        per_topic_smoothness.append(np.mean(pair_scores))
+
+    return float(np.mean(per_topic_smoothness))
 
 
 # --- Predictive Perplexity (PPL) ---

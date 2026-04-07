@@ -45,6 +45,7 @@ def main():
     parser.add_argument("--kl_warmup_epochs", type=int, default=None)
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--alpha", type=float, default=None)
     parser.add_argument("--kappa", type=float, default=None)
     parser.add_argument("--tau0", type=float, default=None)
     parser.add_argument("--top_m", type=int, default=None)
@@ -61,7 +62,7 @@ def main():
     # Override with command-line arguments
     for key in [
         "data_dir", "n_topics", "enc_hidden", "dropout", "lr", "weight_decay",
-        "epochs", "kl_warmup_epochs", "patience", "batch_size", "kappa", "tau0",
+        "epochs", "kl_warmup_epochs", "patience", "batch_size", "alpha", "kappa", "tau0",
         "top_m", "npmi_top_n", "output_dir", "seed", "device",
     ]:
         val = getattr(args, key, None)
@@ -107,6 +108,7 @@ def main():
         kl_warmup_epochs=config["kl_warmup_epochs"],
         patience=config["patience"],
         batch_size=config["batch_size"],
+        alpha=config.get("alpha", 0.9),
         kappa=config["kappa"],
         tau0=config["tau0"],
         top_m=config["top_m"],
