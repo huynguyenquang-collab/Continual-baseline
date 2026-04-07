@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+outputs/
+data/
+*.npy
+*.npz
+.DS_Store
+nohup.out
