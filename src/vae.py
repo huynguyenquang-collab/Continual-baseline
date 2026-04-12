@@ -89,6 +89,19 @@ class ProdLDADecoder(nn.Module):
         # BN on pre-softmax logits (critical for ProdLDA stability)
         self.bn = nn.BatchNorm1d(vocab_size, affine=True)
 
+    def combine_topic_word_logits(
+        self, global_beta: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Return ϕ_global + Δϕ_local_t on the decoder's current device."""
+        local_logits = self.topic_word_logits.weight.T  # (n_topics, vocab_size)
+        if global_beta is None:
+            return local_logits
+        global_beta = global_beta.detach().to(
+            device=local_logits.device,
+            dtype=local_logits.dtype,
+        )
+        return global_beta + local_logits
+
     def forward(self, theta: torch.Tensor, global_beta: Optional[torch.Tensor] = None):
         """
         Args:
@@ -97,14 +110,7 @@ class ProdLDADecoder(nn.Module):
         Returns:
             log_recon: (batch, vocab_size) log-probability of words
         """
-        # Local delta logits: Δϕ_local_t
-        local_logits = self.topic_word_logits.weight.T  # (n_topics, vocab_size)
-
-        # g(ϕ_global, Δϕ_local_t) = ϕ_global + Δϕ_local_t
-        if global_beta is not None:
-            combined = global_beta + local_logits
-        else:
-            combined = local_logits
+        combined = self.combine_topic_word_logits(global_beta)
 
         # θ · β_logits → (batch, vocab_size) unnormalized scores
         logits = torch.mm(theta, combined)  # (batch, vocab_size)
@@ -197,13 +203,9 @@ class ProdLDA(nn.Module):
         These correspond to ϕ_local_t = softmax(ϕ_global + Δϕ_local_t).
         """
         with torch.no_grad():
-            local_logits = self.decoder.topic_word_logits.weight.T.detach()
-            if global_beta is not None:
-                combined = global_beta.detach() + local_logits
-            else:
-                combined = local_logits
+            combined = self.decoder.combine_topic_word_logits(global_beta)
             beta = F.softmax(combined, dim=-1)
-        return beta.cpu().numpy()
+        return beta.detach().cpu().numpy()
 
     def get_topic_word_logits(self, global_beta: Optional[torch.Tensor] = None) -> np.ndarray:
         """Get raw topic-word logits: (n_topics, vocab_size).
@@ -212,12 +214,8 @@ class ProdLDA(nn.Module):
         (useful for the global memory update in Algorithm 2, line 9).
         """
         with torch.no_grad():
-            local_logits = self.decoder.topic_word_logits.weight.T.detach()
-            if global_beta is not None:
-                combined = global_beta.detach() + local_logits
-            else:
-                combined = local_logits
-        return combined.cpu().numpy()
+            combined = self.decoder.combine_topic_word_logits(global_beta)
+        return combined.detach().cpu().numpy()
 
 
 # ─── Training Loop ───────────────────────────────────────────────────────────

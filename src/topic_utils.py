@@ -488,3 +488,7 @@ def save_topics(topics: list[Topic], path: str, top_n: int = 15) -> None:
         for t in topics:
             words = t.words[:top_n]
             f.write(" ".join(words) + "\n")
+
+def split_text_word(texts):
+    texts = [text.split() for text in texts]
+    return texts
