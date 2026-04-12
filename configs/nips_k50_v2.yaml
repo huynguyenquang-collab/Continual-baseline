@@ -1,0 +1,32 @@
+# CoNTM — NIPS K=50 improved (paper Table 1: TC=0.087, TD=0.969, TQ=0.084)
+# Previous run got TC=-0.192 — trying lower LR and more epochs for convergence.
+
+# ── Data ──
+data_dir: "data/NIPS"
+
+# ── Model ──
+n_topics: 50
+enc_hidden: 256
+dropout: 0.2
+
+# ── Training ──
+lr: 0.002                 # reduced from 0.01 to help convergence
+weight_decay: 1.0e-6
+epochs: 200               # doubled from 100 — early timestamps hit max epoch
+kl_warmup_epochs: 30      # longer warmup
+patience: 15              # more patience
+batch_size: 256
+alpha: 0.90
+
+# ── Global Memory ──
+kappa: 0.7
+tau0: 1.0
+
+# ── Evaluation ──
+top_m: 15
+npmi_top_n: 10
+
+# ── Output ──
+output_dir: "outputs_k50_v2"
+seed: 42
+device: "auto"

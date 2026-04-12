@@ -232,7 +232,7 @@ def run_contm(
         print(f"    ρ_t:         {rho:.4f}")
         print(f"    Train time:  {train_time:.1f}s")
 
-        print_topics(topics[:10], label=f"T{ts} ({ts_label})")
+        print_topics(topics, label=f"T{ts} ({ts_label})")
 
         # ── Save per-timestamp outputs ──
         ts_dir = out / f"T{ts}"
@@ -312,6 +312,6 @@ def run_contm(
     global_beta_dist = global_memory.get_global_beta_dist()
     global_topics = extract_topics(global_beta_dist, vocab, top_m=top_m, source="global")
     save_topics(global_topics, str(out / "final_global_topics.txt"), top_n=top_m)
-    print_topics(global_topics[:10], label="Final Global")
+    print_topics(global_topics, label="Final Global")
 
     return summary

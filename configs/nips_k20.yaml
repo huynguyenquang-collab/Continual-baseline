@@ -1,0 +1,33 @@
+# CoNTM — NIPS K=20 (paper Appendix E: TC=0.10, TD=0.99, TQ=0.10)
+# Paper says: "under the 20-topic settings, our model also outperformed
+# other models in the NIPS dataset, which was not the case when using 50 topics."
+
+# ── Data ──
+data_dir: "data/NIPS"
+
+# ── Model ──
+n_topics: 20              # K=20 as in paper Appendix E
+enc_hidden: 256
+dropout: 0.2
+
+# ── Training ──
+lr: 0.002                 # lower LR for better convergence (paper used 0.01)
+weight_decay: 1.0e-6
+epochs: 200               # more epochs — previous run hit 100 without converging
+kl_warmup_epochs: 30      # longer warmup for more stable KL annealing
+patience: 15              # more patience for early stopping
+batch_size: 256
+alpha: 0.90               # early stopping: alpha*val_loss + (1-alpha)*val_ppl
+
+# ── Global Memory ──
+kappa: 0.7                # paper: κ=0.7 yields best results
+tau0: 1.0                 # paper: τ=1
+
+# ── Evaluation ──
+top_m: 15
+npmi_top_n: 10
+
+# ── Output ──
+output_dir: "outputs_k20"
+seed: 42
+device: "auto"

@@ -158,7 +158,8 @@ def _compute_npmi_manual(
                 df_ij = len(docs_ij)
 
                 if df_ij == 0 or df_i == 0 or df_j == 0:
-                    pairs_npmi.append(-1.0)
+                    # skip pairs with no co-occurrence (gensim c_npmi also skips these)
+                    continue
                 else:
                     p_ij = df_ij / n_docs
                     p_i = df_i / n_docs
